@@ -62,6 +62,7 @@ class DataParallelPPOActor(BasePPOActor):
         role = "Ref" if actor_optimizer is None else "Actor"
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
+        self.use_expert_logprob = self.config.get("use_expert_logprob", False)
         if torch.distributed.get_rank() == 0:
             print(f"{role} use_remove_padding={self.use_remove_padding}")
         self.use_fused_kernels = self.config.get("use_fused_kernels", False)
@@ -83,6 +84,54 @@ class DataParallelPPOActor(BasePPOActor):
         )
         self.device_name = get_device_name()
 
+    def expert_log_prob(self, log_probs, router_logits, response_mask):
+        """
+        Returns:
+            expert_log_prob : (bs) average on per expert
+        """
+
+        *_, num_layers, num_experts = router_logits.shape
+        bsz, T = log_probs.shape
+
+        topk = getattr(self.actor_module, "num_experts_per_tok", 1)
+
+        if topk > 1:
+            _, selected_experts = torch.topk(router_logits, topk, dim=-1) # bsz, T, L, topk
+        else:
+            selected_experts = torch.argmin(router_logits, dim=-1, keepdim=True)
+        
+        # assign = torch.nn.functional.one_hot(selected, num_classes=num_experts)  # [B, T, L, K, E]
+        # assign = assign.to(dtype=log_probs.dtype)
+
+        # logp = log_probs.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).expand(-1, -1, L, K, 1)  # [B, T, L, K, 1]
+
+        # resp = response_mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)           # [B, T, 1, 1, 1]
+        # resp = resp.expand(-1, -1, L, K, 1).to(log_probs.dtype)       # [B, T, L, K, 1]
+
+        # total = (assign * logp).sum(dim=-2)    # [B, T, L, E]
+        # count = (assign * resp).sum(dim=-2)    # [B, T, L, E]
+
+        # total = total.sum(dim=1)    # [B, L, E]
+        # count = count.sum(dim=1) 
+
+        log_probs = log_probs.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, num_layers, num_experts)
+        total = torch.zeros(bsz, T, num_layers, num_experts, device=log_probs.device)
+        count = torch.zeros_like(total)
+        response_mask = response_mask.unsqueeze(-1).unsqueeze(-1).expand(bsz, T, num_layers, num_experts)
+        total.scatter_add_(3, selected_experts, log_probs)
+        total = total.sum(dim=1) # B,L,E
+        count.scatter_add_(3, selected_experts, response_mask.to(count.device))
+        count = count.sum(dim=1)
+
+        logprob_per_expert = total / count.clamp(1) # [B, L, E]
+
+        # return logprob_per_expert
+
+        chosen_experts = (count>0).sum(dim=-1)
+        expert_weight = (logprob_per_expert.sum(dim=-1) / chosen_experts).mean(dim=-1)
+
+        return expert_weight
+
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -103,6 +152,7 @@ class DataParallelPPOActor(BasePPOActor):
             batch_size, seqlen = input_ids.shape
             attention_mask = micro_batch["attention_mask"]
             position_ids = micro_batch["position_ids"]
+            response_mask = micro_batch["response_mask"]
             entropy = None
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
@@ -173,6 +223,7 @@ class DataParallelPPOActor(BasePPOActor):
                     position_ids=position_ids_rmpad,
                     **multi_modal_inputs,
                     use_cache=False,
+                    output_router_logits=True
                     **extra_args,
                 )  # prevent model thinks we are generating
 
@@ -234,6 +285,17 @@ class DataParallelPPOActor(BasePPOActor):
                     seqlen=seqlen,
                 )
 
+                if self.use_expert_logprob:
+                    router_logits = output.router_logits # layer, total_nnz, E
+                    if isinstance(router_logits, tuple):
+                        router_logits = torch.stack(router_logits, dim=0).permute(1,0,2)
+                    full_router_logits = pad_input(
+                        router_logits,
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                    router_logits=full_router_logits[:,-response_length-1:-1,:,:]
                 # only return response part:
                 if calculate_entropy:
                     entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
@@ -251,6 +313,7 @@ class DataParallelPPOActor(BasePPOActor):
                     position_ids=position_ids,
                     **multi_modal_inputs,
                     use_cache=False,
+                    output_router_logits=True,
                     **extra_args,
                 )  # prevent model thinks we are generating
 
@@ -269,8 +332,14 @@ class DataParallelPPOActor(BasePPOActor):
                             entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
-
-            return entropy, log_probs
+                if self.use_expert_logprob:
+                    router_logits = output.router_logits
+                    if isinstance(router_logits, tuple):
+                        router_logits = torch.stack(router_logits, dim=0).permute(1,0,2)
+            expert_logprobs = None
+            if self.use_expert_logprob:
+                expert_logprobs = self.expert_log_prob(log_probs, router_logits, response_mask)
+            return entropy, log_probs, expert_logprobs
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -319,7 +388,7 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
-        select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "response_mask"]
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
@@ -332,28 +401,34 @@ class DataParallelPPOActor(BasePPOActor):
 
         log_probs_lst = []
         entropy_lst = []
+        expert_logprobs_lst = []
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                entropy, log_probs = self._forward_micro_batch(
+                entropy, log_probs, expert_logprobs = self._forward_micro_batch(
                     model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                 )
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)
+            if self.use_expert_logprob:
+                expert_logprobs_lst.append(expert_logprobs)
 
         log_probs = torch.concat(log_probs_lst, dim=0)
         entropys = None
+        expert_logprobs = None
         if calculate_entropy:
             entropys = torch.concat(entropy_lst, dim=0)
 
+        if self.use_expert_logprob:
+            expert_logprobs = torch.concat(expert_logprobs_lst, dim=0)
         if use_dynamic_bsz:
             log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
             if calculate_entropy:
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
 
-        return log_probs, entropys
+        return log_probs, entropys, expert_logprobs
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
@@ -373,6 +448,8 @@ class DataParallelPPOActor(BasePPOActor):
         ]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
+        if self.use_expert_logprob:
+            select_keys.append("old_expert_logprobs")
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
@@ -423,7 +500,7 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
-                    entropy, log_prob = self._forward_micro_batch(
+                    entropy, log_prob, expert_logrobs = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
 
@@ -453,15 +530,28 @@ class DataParallelPPOActor(BasePPOActor):
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
 
                     # Compute policy loss (all functions return 4 values)
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        loss_agg_mode=loss_agg_mode,
-                        config=self.config,
-                        rollout_is_weights=rollout_is_weights,
-                    )
+                    if loss_mode == "gepo":
+                        old_expert_logprobs = model_inputs["old_expert_logprobs"]
+
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                            old_log_prob=old_expert_logprobs,
+                            log_prob=expert_logprobs,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                        )
+                    else:
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                        )
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)

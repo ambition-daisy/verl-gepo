@@ -975,11 +975,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             with adapter_ctx:
-                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
-            output = DataProto.from_dict(
-                tensors={"old_log_probs": output, "entropys": entropys},
-                meta_info={"temperature": self.config.rollout.temperature},
-            )
+                output, entropys, expert_logprobs = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+            if expert_logprobs is not None:
+                output = DataProto.from_dict(
+                    tensors={"old_log_probs": output, "entropys": entropys, "old_expert_logprobs": expert_logprobs},
+                    meta_info={"temperature": self.config.rollout.temperature},
+                )
+            else:
+                output = DataProto.from_dict(
+                    tensors={"old_log_probs": output, "entropys": entropys},
+                    meta_info={"temperature": self.config.rollout.temperature},
+                )
 
         output = output.to("cpu")
 
@@ -1015,7 +1021,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
-            output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+            output, *_ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
             output = DataProto.from_dict(tensors={"ref_log_prob": output})
 
         output = output.to("cpu")
