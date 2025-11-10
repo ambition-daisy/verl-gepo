@@ -114,13 +114,13 @@ class DataParallelPPOActor(BasePPOActor):
         # total = total.sum(dim=1)    # [B, L, E]
         # count = count.sum(dim=1) 
 
-        log_probs = log_probs.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, num_layers, num_experts)
+        log_probs = log_probs.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, num_layers, topk)
         total = torch.zeros(bsz, T, num_layers, num_experts, device=log_probs.device)
         count = torch.zeros_like(total)
         response_mask = response_mask.unsqueeze(-1).unsqueeze(-1).expand(bsz, T, num_layers, num_experts)
         total.scatter_add_(3, selected_experts, log_probs)
         total = total.sum(dim=1) # B,L,E
-        count.scatter_add_(3, selected_experts, response_mask.to(count.device))
+        count.scatter_add_(3, selected_experts, response_mask.to(count.dtype))
         count = count.sum(dim=1)
 
         logprob_per_expert = total / count.clamp(1) # [B, L, E]
@@ -223,7 +223,7 @@ class DataParallelPPOActor(BasePPOActor):
                     position_ids=position_ids_rmpad,
                     **multi_modal_inputs,
                     use_cache=False,
-                    output_router_logits=True
+                    output_router_logits=True,
                     **extra_args,
                 )  # prevent model thinks we are generating
 
@@ -500,7 +500,7 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
-                    entropy, log_prob, expert_logrobs = self._forward_micro_batch(
+                    entropy, log_prob, expert_logprobs = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
 

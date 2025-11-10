@@ -427,6 +427,8 @@ def create_rl_sampler(data_config, dataset):
         seed = data_config.get("seed")
         if seed is not None:
             train_dataloader_generator.manual_seed(seed)
+        else:
+            raise ValueError("train dataloader seed is null")
         sampler = RandomSampler(data_source=dataset, generator=train_dataloader_generator)
     else:
         # If shuffling is disabled, use a sequential sampler to iterate through the dataset in order.
